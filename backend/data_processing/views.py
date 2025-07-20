@@ -1,250 +1,230 @@
-from django.shortcuts import render
-from rest_framework import status, viewsets
-from rest_framework.decorators import api_view, action
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from rest_framework.parsers import MultiPartParser, FileUploadParser
+from rest_framework import status
 from django.core.files.storage import default_storage
-from django.core.files.base import ContentFile
-import pandas as pd
-import numpy as np
 import json
-import io
 import os
-from .models import DataSet, CleaningOperation
-from .serializers import (
-    DataSetSerializer, CleaningOperationSerializer, FileUploadSerializer,
-    DataPreviewSerializer, CleaningRequestSerializer, StatisticsSerializer
-)
-
-# Variable globale pour stocker les données en mémoire (en production, utiliser Redis ou une base de données)
-datasets_cache = {}
+from .models import UploadedFile, DataQualityReport
+from .services import DataProcessingService
 
 @api_view(['GET'])
-def api_root(request):
-    """Point d'entrée de l'API Django"""
+def api_info(request):
+    """Informations sur l'API"""
     return Response({
-        'message': 'Bienvenue sur DimaClean API Django',
-        'version': '2.0.0',
-        'framework': 'Django REST Framework',
+        'message': 'DimaClean API v1.0',
+        'status': 'active',
         'endpoints': {
             'upload': '/api/upload/',
-            'datasets': '/api/datasets/',
-            'preview': '/api/datasets/{id}/preview/',
-            'clean': '/api/datasets/{id}/clean/',
-            'statistics': '/api/datasets/{id}/statistics/',
-            'export': '/api/datasets/{id}/export/',
+            'files': '/api/files/',
+            'dashboard': '/api/dashboard/stats/'
         }
     })
 
 @api_view(['POST'])
 def upload_file(request):
-    """Upload et analyse d'un fichier CSV"""
-    serializer = FileUploadSerializer(data=request.data)
-
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
+    """Upload d'un fichier CSV"""
     try:
-        uploaded_file = serializer.validated_data['file']
-
-        # Lire le contenu du fichier
-        content = uploaded_file.read().decode('utf-8')
-        df = pd.read_csv(io.StringIO(content))
-
-        # Créer l'objet DataSet
-        dataset = DataSet.objects.create(
-            filename=f"dataset_{DataSet.objects.count() + 1}.csv",
-            original_filename=uploaded_file.name,
-            file_size=uploaded_file.size,
-            rows_count=len(df),
-            columns_count=len(df.columns),
-            column_names=df.columns.tolist(),
-            data_types={col: str(df[col].dtype) for col in df.columns},
-            missing_values={col: int(df[col].isnull().sum()) for col in df.columns}
+        if 'file' not in request.FILES:
+            return Response({'error': 'Aucun fichier fourni'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        file = request.FILES['file']
+        
+        if not file.name.endswith('.csv'):
+            return Response({'error': 'Seuls les fichiers CSV sont acceptés'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Sauvegarder le fichier
+        uploaded_file = UploadedFile.objects.create(
+            name=file.name,
+            file=file,
+            size=file.size,
+            status='uploaded'
         )
-
-        # Stocker les données en cache
-        datasets_cache[dataset.id] = {
-            'original': df.copy(),
-            'current': df.copy()
-        }
-
-        # Préparer la réponse
-        response_data = {
-            'status': 'success',
-            'message': 'Fichier uploadé avec succès',
-            'dataset': DataSetSerializer(dataset).data,
-            'preview': df.head(10).to_dict('records')
-        }
-
-        return Response(response_data, status=status.HTTP_201_CREATED)
-
-    except Exception as e:
+        
         return Response({
-            'status': 'error',
-            'message': f'Erreur lors du traitement du fichier: {str(e)}'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            'id': uploaded_file.id,
+            'name': uploaded_file.name,
+            'size': uploaded_file.size,
+            'status': uploaded_file.status,
+            'message': 'Fichier uploadé avec succès'
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
-def dataset_preview(request, dataset_id):
-    """Aperçu des données d'un dataset"""
+def list_files(request):
+    """Liste des fichiers uploadés"""
+    files = UploadedFile.objects.all().order_by('-created_at')
+    
+    files_data = []
+    for file in files:
+        files_data.append({
+            'id': file.id,
+            'name': file.name,
+            'size': file.size,
+            'status': file.status,
+            'rows_count': file.rows_count,
+            'quality_score': file.quality_score,
+            'created_at': file.created_at.isoformat()
+        })
+    
+    return Response({
+        'results': files_data,
+        'count': len(files_data)
+    })
+
+@api_view(['GET'])
+def file_detail(request, file_id):
+    """Détails d'un fichier"""
     try:
-        dataset = DataSet.objects.get(id=dataset_id)
-
-        if dataset_id not in datasets_cache:
-            return Response({
-                'status': 'error',
-                'message': 'Données non trouvées en cache'
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        df = datasets_cache[dataset_id]['current']
-
-        response_data = {
-            'status': 'success',
-            'data': {
-                'rows': len(df),
-                'columns': len(df.columns),
-                'preview': df.head(20).to_dict('records'),
-                'column_info': {
-                    col: {
-                        'type': str(df[col].dtype),
-                        'missing': int(df[col].isnull().sum()),
-                        'unique': int(df[col].nunique())
-                    }
-                    for col in df.columns
-                }
-            }
-        }
-
-        return Response(response_data)
-
-    except DataSet.DoesNotExist:
+        file = UploadedFile.objects.get(id=file_id)
         return Response({
-            'status': 'error',
-            'message': 'Dataset non trouvé'
-        }, status=status.HTTP_404_NOT_FOUND)
+            'id': file.id,
+            'name': file.name,
+            'size': file.size,
+            'status': file.status,
+            'rows_count': file.rows_count,
+            'columns_count': file.columns_count,
+            'quality_score': file.quality_score,
+            'created_at': file.created_at.isoformat(),
+            'updated_at': file.updated_at.isoformat()
+        })
+    except UploadedFile.DoesNotExist:
+        return Response({'error': 'Fichier non trouvé'}, status=status.HTTP_404_NOT_FOUND)
+
+@api_view(['GET'])
+def preview_data(request, file_id):
+    """Prévisualisation des données"""
+    try:
+        file = UploadedFile.objects.get(id=file_id)
+        limit = int(request.GET.get('limit', 100))
+        
+        file_path = file.file.path
+        preview_data = DataProcessingService.get_preview_data(file_path, limit)
+        
+        return Response(preview_data)
+        
+    except UploadedFile.DoesNotExist:
+        return Response({'error': 'Fichier non trouvé'}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        return Response({
-            'status': 'error',
-            'message': f'Erreur lors de l\'aperçu: {str(e)}'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def analyze_data(request, file_id):
+    """Analyser la qualité des données"""
+    try:
+        file = UploadedFile.objects.get(id=file_id)
+        file.status = 'analyzing'
+        file.save()
+        
+        file_path = file.file.path
+        analysis = DataProcessingService.analyze_file(file_path)
+        
+        # Mettre à jour le fichier avec les résultats
+        file.rows_count = analysis['rows_count']
+        file.columns_count = analysis['columns_count']
+        file.quality_score = analysis['quality_score']
+        file.status = 'analyzed'
+        file.save()
+        
+        # Créer ou mettre à jour le rapport de qualité
+        report, created = DataQualityReport.objects.get_or_create(
+            file=file,
+            defaults={
+                'missing_values': analysis['missing_values'],
+                'duplicates_count': analysis['duplicates_count'],
+                'data_types': analysis['data_types'],
+                'statistics': analysis
+            }
+        )
+        
+        return Response(analysis)
+        
+    except UploadedFile.DoesNotExist:
+        return Response({'error': 'Fichier non trouvé'}, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        file.status = 'error'
+        file.save()
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['POST'])
-def clean_dataset(request, dataset_id):
-    """Nettoyage automatique des données d'un dataset"""
+def clean_data(request, file_id):
+    """Nettoyer les données"""
     try:
-        dataset = DataSet.objects.get(id=dataset_id)
-
-        if dataset_id not in datasets_cache:
-            return Response({
-                'status': 'error',
-                'message': 'Données non trouvées en cache'
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        df = datasets_cache[dataset_id]['current'].copy()
-        cleaning_report = []
-        operations_performed = []
-
-        # 1. Supprimer les doublons
-        duplicates_before = df.duplicated().sum()
-        if duplicates_before > 0:
-            df = df.drop_duplicates()
-            operation_desc = f"Suppression de {duplicates_before} lignes dupliquées"
-            cleaning_report.append(operation_desc)
-
-            # Enregistrer l'opération
-            CleaningOperation.objects.create(
-                dataset=dataset,
-                operation_type='remove_duplicates',
-                description=operation_desc,
-                affected_rows=duplicates_before
-            )
-
-        # 2. Traiter les valeurs manquantes
-        for col in df.columns:
-            missing_count = df[col].isnull().sum()
-            if missing_count > 0:
-                if df[col].dtype in ['int64', 'float64']:
-                    # Pour les colonnes numériques, remplacer par la médiane
-                    median_value = df[col].median()
-                    df[col].fillna(median_value, inplace=True)
-                    operation_desc = f"Colonne '{col}': {missing_count} valeurs manquantes remplacées par la médiane ({median_value})"
-                    cleaning_report.append(operation_desc)
-
-                    CleaningOperation.objects.create(
-                        dataset=dataset,
-                        operation_type='fill_missing_numeric',
-                        column_name=col,
-                        description=operation_desc,
-                        affected_rows=missing_count
-                    )
-                else:
-                    # Pour les colonnes texte, remplacer par le mode ou "Inconnu"
-                    mode_value = df[col].mode()
-                    if len(mode_value) > 0:
-                        df[col].fillna(mode_value[0], inplace=True)
-                        operation_desc = f"Colonne '{col}': {missing_count} valeurs manquantes remplacées par le mode ('{mode_value[0]}')"
-                    else:
-                        df[col].fillna("Inconnu", inplace=True)
-                        operation_desc = f"Colonne '{col}': {missing_count} valeurs manquantes remplacées par 'Inconnu'"
-
-                    cleaning_report.append(operation_desc)
-
-                    CleaningOperation.objects.create(
-                        dataset=dataset,
-                        operation_type='fill_missing_text',
-                        column_name=col,
-                        description=operation_desc,
-                        affected_rows=missing_count
-                    )
-
-        # 3. Normaliser les colonnes texte
-        text_columns_normalized = 0
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].astype(str).str.strip()
-            text_columns_normalized += 1
-
-        if text_columns_normalized > 0:
-            operation_desc = f"Normalisation de {text_columns_normalized} colonnes texte (suppression des espaces)"
-            cleaning_report.append(operation_desc)
-
-            CleaningOperation.objects.create(
-                dataset=dataset,
-                operation_type='normalize_text',
-                description=operation_desc,
-                affected_rows=0
-            )
-
-        # Mettre à jour les données en cache
-        datasets_cache[dataset_id]['current'] = df
-
-        # Mettre à jour le dataset
-        dataset.is_cleaned = True
-        dataset.cleaning_report = cleaning_report
-        dataset.rows_count = len(df)
-        dataset.missing_values = {col: int(df[col].isnull().sum()) for col in df.columns}
-        dataset.save()
-
-        response_data = {
-            'status': 'success',
-            'message': 'Données nettoyées avec succès',
-            'cleaning_report': cleaning_report,
-            'data': {
-                'rows': len(df),
-                'columns': len(df.columns),
-                'preview': df.head(10).to_dict('records')
-            }
-        }
-
-        return Response(response_data)
-
-    except DataSet.DoesNotExist:
+        file = UploadedFile.objects.get(id=file_id)
+        file.status = 'processing'
+        file.save()
+        
+        options = request.data.get('options', {})
+        file_path = file.file.path
+        
+        result = DataProcessingService.clean_data(file_path, options)
+        
+        file.status = 'processed'
+        file.save()
+        
         return Response({
-            'status': 'error',
-            'message': 'Dataset non trouvé'
-        }, status=status.HTTP_404_NOT_FOUND)
+            'task_id': f'task_{file_id}',
+            'status': 'completed',
+            'result': result
+        })
+        
+    except UploadedFile.DoesNotExist:
+        return Response({'error': 'Fichier non trouvé'}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
+        file.status = 'error'
+        file.save()
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def export_data(request, file_id):
+    """Exporter les données nettoyées"""
+    try:
+        file = UploadedFile.objects.get(id=file_id)
+        format_type = request.GET.get('format', 'csv')
+        
+        if format_type == 'csv':
+            cleaned_file_path = file.file.path.replace('.csv', '_cleaned.csv')
+            
+            if os.path.exists(cleaned_file_path):
+                with open(cleaned_file_path, 'rb') as f:
+                    response = HttpResponse(f.read(), content_type='text/csv')
+                    response['Content-Disposition'] = f'attachment; filename="{file.name}_cleaned.csv"'
+                    return response
+            else:
+                return Response({'error': 'Fichier nettoyé non trouvé'}, status=status.HTTP_404_NOT_FOUND)
+        
+        return Response({'error': 'Format non supporté'}, status=status.HTTP_400_BAD_REQUEST)
+        
+    except UploadedFile.DoesNotExist:
+        return Response({'error': 'Fichier non trouvé'}, status=status.HTTP_404_NOT_FOUND)
+
+@api_view(['GET'])
+def dashboard_stats(request):
+    """Statistiques pour le dashboard"""
+    try:
+        total_files = UploadedFile.objects.count()
+        processed_files = UploadedFile.objects.filter(status='processed').count()
+        
+        # Calculer les statistiques
+        files = UploadedFile.objects.all()
+        total_rows = sum(f.rows_count or 0 for f in files)
+        avg_quality = sum(f.quality_score or 0 for f in files if f.quality_score) / max(1, len([f for f in files if f.quality_score]))
+        
         return Response({
-            'status': 'error',
-            'message': f'Erreur lors du nettoyage: {str(e)}'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            'total_files': total_files,
+            'processed_files': processed_files,
+            'total_rows': total_rows,
+            'average_quality': round(avg_quality, 1),
+            'files_growth': 15,  # Mock data
+            'rows_growth': 23,   # Mock data
+            'quality_improvement': 8,  # Mock data
+            'time_saved': 45,    # Mock data
+            'time_saved_growth': 12  # Mock data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -1,45 +1,33 @@
 from django.db import models
-import json
+from django.contrib.auth.models import User
 
-class DataSet(models.Model):
-    """Modèle pour stocker les informations sur un dataset uploadé"""
-    filename = models.CharField(max_length=255)
-    original_filename = models.CharField(max_length=255)
-    upload_date = models.DateTimeField(auto_now_add=True)
-    file_size = models.IntegerField()
-    rows_count = models.IntegerField()
-    columns_count = models.IntegerField()
-    column_names = models.JSONField()  # Liste des noms de colonnes
-    data_types = models.JSONField()    # Types de données par colonne
-    missing_values = models.JSONField() # Valeurs manquantes par colonne
-    is_cleaned = models.BooleanField(default=False)
-    cleaning_report = models.JSONField(null=True, blank=True)
-
-    class Meta:
-        ordering = ['-upload_date']
-
-    def __str__(self):
-        return f"{self.original_filename} - {self.upload_date.strftime('%Y-%m-%d %H:%M')}"
-
-class CleaningOperation(models.Model):
-    """Modèle pour enregistrer les opérations de nettoyage effectuées"""
-    OPERATION_TYPES = [
-        ('remove_duplicates', 'Suppression des doublons'),
-        ('fill_missing_numeric', 'Remplissage valeurs manquantes numériques'),
-        ('fill_missing_text', 'Remplissage valeurs manquantes texte'),
-        ('normalize_text', 'Normalisation du texte'),
-        ('remove_outliers', 'Suppression des outliers'),
+class UploadedFile(models.Model):
+    STATUS_CHOICES = [
+        ('uploaded', 'Uploaded'),
+        ('analyzing', 'Analyzing'),
+        ('analyzed', 'Analyzed'),
+        ('processing', 'Processing'),
+        ('processed', 'Processed'),
+        ('error', 'Error'),
     ]
-
-    dataset = models.ForeignKey(DataSet, on_delete=models.CASCADE, related_name='operations')
-    operation_type = models.CharField(max_length=50, choices=OPERATION_TYPES)
-    column_name = models.CharField(max_length=255, null=True, blank=True)
-    description = models.TextField()
-    affected_rows = models.IntegerField()
-    timestamp = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['-timestamp']
-
+    
+    name = models.CharField(max_length=255)
+    file = models.FileField(upload_to='uploads/')
+    size = models.BigIntegerField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='uploaded')
+    rows_count = models.IntegerField(null=True, blank=True)
+    columns_count = models.IntegerField(null=True, blank=True)
+    quality_score = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
     def __str__(self):
-        return f"{self.get_operation_type_display()} - {self.dataset.original_filename}"
+        return self.name
+
+class DataQualityReport(models.Model):
+    file = models.OneToOneField(UploadedFile, on_delete=models.CASCADE)
+    missing_values = models.JSONField(default=dict)
+    duplicates_count = models.IntegerField(default=0)
+    data_types = models.JSONField(default=dict)
+    statistics = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
